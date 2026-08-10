@@ -96,6 +96,7 @@
 #include "google/protobuf/symbol.h"
 #include "google/protobuf/symbol_checker.h"
 #include "google/protobuf/text_format.h"
+#include "google/protobuf/thread.h"
 #include "google/protobuf/unknown_field_set.h"
 
 
@@ -4271,9 +4272,20 @@ const FileDescriptor* DescriptorPool::BuildFileFromDatabase(
             this, tables_.get(), deferred_validation, default_error_collector_)
             ->BuildFile(proto);
   };
+  // Some conservative value for the stack required. We don't want to be even
+  // close to the actual value.
+  constexpr size_t kMinimumStackSizeRequired =
+      internal::HasAnySanitizer() ? 10'000 : 3'000;
   if (dispatcher_ != nullptr) {
+    PROTOBUF_DEBUG_COUNTER("BuildFileFromDatabase.Dispatcher").Inc();
     (*dispatcher_)(build_file);
+  } else if (internal::GetEstimatedThreadStackRemaining() <
+             kMinimumStackSizeRequired) {
+    PROTOBUF_DEBUG_COUNTER("BuildFileFromDatabase.SpawnThread").Inc();
+    // Not enough stack space here. Spawn in a separate thread.
+    internal::RunSyncInSeparateThread(build_file);
   } else {
+    PROTOBUF_DEBUG_COUNTER("BuildFileFromDatabase.Local").Inc();
     build_file();
   }
   if (result == nullptr) {
