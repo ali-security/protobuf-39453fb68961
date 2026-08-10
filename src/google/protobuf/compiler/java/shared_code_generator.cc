@@ -192,8 +192,8 @@ void SharedCodeGenerator::GenerateDescriptors(io::Printer* printer) {
 
     for (int i = 0; i < dependencies.size(); i++) {
       const std::string& dependency = dependencies[i].second;
-      printer->Print("      $dependency$.getDescriptor(),\n", "dependency",
-                     dependency);
+      printer->Print("      $dependency$.InternalDescriptors.descriptor,\n",
+                     "dependency", dependency);
     }
   }
 
