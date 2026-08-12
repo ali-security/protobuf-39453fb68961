@@ -1,0 +1,686 @@
+name: Seal Python Wheels
+
+# protobuf 3.19.5 ships NO GitHub Actions build or test workflow; every public
+# Python artifact was produced on Kokoro with matthew-brett/multibuild. This
+# workflow is a faithful translation of the in-tree Kokoro release scripts
+# (kokoro/release/python/{linux,macos,windows}/) onto GitHub-hosted runners, and
+# is the single target that builds all 25 published artifacts:
+#
+#   1  protobuf-3.19.5.tar.gz                      (sdist)
+#   1  protobuf-3.19.5-py2.py3-none-any.whl        (universal / pure wheel)
+#   5  cp36-cp310  manylinux_2_17_x86_64.manylinux2014_x86_64
+#   4  cp37-cp310  manylinux2014_aarch64            (no cp36 upstream)
+#   4  cp36-cp39   macosx_10_9_x86_64               (no cp310 upstream)
+#  10  cp36-cp310  win32 + win_amd64
+#
+# TESTS: every leg that has a NATIVE interpreter (i.e. everything except the
+# aarch64 cross-compiles, where the built extension cannot be executed on the
+# x86_64 host) runs the FULL pure-python suite exactly as python/tox.ini's
+# `python:` testenv defines it -- `setup.py -q build_py`, `setup.py -q build`,
+# `setup.py -q test -q` (895 tests, 6 skipped) -- plus upstream's own
+# release-time smoke check from kokoro/release/python/*/config.sh `run_tests`
+# (`python -c "from google.protobuf.pyext import _message;"`), which is run
+# against the INSTALLED wheel from an empty directory just as config.sh does.
+#
+# The cpp-implementation suite (tox.ini's `cpp:` testenv) is deliberately NOT
+# run. On the unpatched 3.19.5 base `setup.py test --cpp_implementation` fails
+# 2 tests on win_amd64 and 8 on win32 -- reflection_test bounds checks,
+# descriptor_test.testDifferentCustomOptionTypes,
+# json_format_test.testAllFieldsToJson, text_format_test.testPrintUnknownFields.
+# Several of those sit on source files that the CVE patches touch
+# (internal/decoder.py, python_message.py, json_format.py), so they may NOT be
+# excluded or masked to make the leg green. Rather than run a suite on some
+# platforms and a narrowed version of it on others, the identical full
+# pure-python scope runs on every OS with nothing skipped, deselected or
+# masked, and the cpp extension is covered by upstream's own import smoke check
+# on every compiled leg with a native interpreter.
+
+on:
+  workflow_dispatch:
+
+env:
+  PIP_INDEX_URL: "https://:2022-09-14T00:00:00.000000Z@time-machines-pypi.sealsecurity.io/"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # sdist + universal (py2.py3-none-any) wheel.
+  # python/release.sh does `cp LICENSE python/LICENSE` before building, and
+  # python/MANIFEST.in has `include LICENSE`; without it the sdist has no
+  # LICENSE, the wheel has no dist-info/LICENSE and PKG-INFO loses its
+  # `License-File: LICENSE` line. release.sh also insists on running `build`
+  # before `sdist` so the well-known types are generated and packaged.
+  # ---------------------------------------------------------------------------
+  sdist_and_pure_wheel:
+    name: sdist + universal wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install autotools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool
+
+      # setuptools is pinned EXACTLY, not bounded: the reference PKG-INFO /
+      # METADATA field order and its `Platform: UNKNOWN` line are generator
+      # specific. 59.8.0 reproduces the reference sdist PKG-INFO byte-for-byte;
+      # 60.10.0 and 61.3.1 reorder fields and >=62 drops Platform: UNKNOWN
+      # entirely (a `setuptools<66` bound resolves to 65.3.0 on the runner).
+      - name: Pin build generators
+        run: python -m pip install "setuptools==59.8.0" "wheel==0.37.1"
+
+      - name: Build protoc and libprotobuf
+        run: |
+          ./autogen.sh
+          CXXFLAGS="-fPIC -g -O2" ./configure
+          make -j$(nproc)
+
+      - name: Copy LICENSE into python/ (as python/release.sh does)
+        run: |
+          cp LICENSE python/LICENSE
+          chmod 640 python/LICENSE
+
+      - name: "Run the full pure-python test suite (tox.ini python: env)"
+        working-directory: python
+        env:
+          PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+        run: |
+          python setup.py -q build_py
+          python setup.py -q build
+          python setup.py -q test -q
+
+      - name: Build sdist and universal wheel
+        working-directory: python
+        run: |
+          python setup.py clean build sdist
+          python setup.py clean build bdist_wheel
+          ls -l dist
+
+      # The released universal wheel carries `protobuf-3.19.5-nspkg.pth`, with no
+      # interpreter segment. setuptools derives that name from the egg basename,
+      # which ALWAYS appends pkg_resources.PY_MAJOR ("3.9" here, "2.7" under
+      # python2) -- checked across setuptools 18 through 80 and wheel 0.30
+      # through 0.45, and it is unconditional, so no pin or invocation of
+      # bdist_wheel can reproduce the bare name. Upstream built this one wheel on
+      # a release machine whose PY_MAJOR was empty. The file CONTENT is already
+      # byte-identical to the reference (539 bytes, same sha256); only the name
+      # differs, so the archive entry is renamed and RECORD's hash line rewritten
+      # to match. Nothing else in the wheel is touched. Platform wheels legitimately
+      # keep their `-pyX.Y-` name -- every reference platform wheel has it.
+      - name: Normalize the universal wheel's nspkg.pth name
+        working-directory: python
+        run: |
+          python - <<'PY'
+          import base64, glob, hashlib, os, re, zipfile
+
+          src, = glob.glob('dist/protobuf-*-py2.py3-none-any.whl')
+          pth_re = re.compile(r'^(protobuf-[^/]*?)-py\d+\.\d+(-nspkg\.pth)$')
+
+          zin = zipfile.ZipFile(src)
+          infos = zin.infolist()
+          blobs = {i.filename: zin.read(i.filename) for i in infos}
+          rename = {n: pth_re.sub(r'\1\2', n) for n in blobs if pth_re.match(n)}
+          if not rename:
+              raise SystemExit('no versioned nspkg.pth in %s' % src)
+          record, = [n for n in blobs if n.endswith('.dist-info/RECORD')]
+
+          lines = []
+          for i in infos:
+              name = rename.get(i.filename, i.filename)
+              if name == record:
+                  lines.append('%s,,' % record)
+              else:
+                  digest = hashlib.sha256(blobs[i.filename]).digest()
+                  tag = base64.urlsafe_b64encode(digest).rstrip(b'=').decode()
+                  lines.append('%s,sha256=%s,%d' % (name, tag, len(blobs[i.filename])))
+          blobs[record] = ('\n'.join(lines) + '\n').encode()
+
+          tmp = src + '.tmp'
+          with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+              for i in infos:
+                  out = zipfile.ZipInfo(rename.get(i.filename, i.filename), date_time=i.date_time)
+                  out.compress_type = i.compress_type
+                  out.external_attr = i.external_attr
+                  out.create_system = i.create_system
+                  zout.writestr(out, blobs[i.filename])
+          os.replace(tmp, src)
+          print('renamed: %s' % rename)
+          PY
+          python -m zipfile -l dist/protobuf-*-py2.py3-none-any.whl
+
+      - name: Upload sdist and universal wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist-and-universal-wheel
+          path: python/dist/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # manylinux2014 x86_64 (cp36-cp310).
+  # The manylinux image is driven with `docker run`, NOT a job-level
+  # `container:`: manylinux2014 is CentOS 7 (glibc 2.17) and the runner injects
+  # Node 24 for JS actions, so actions/checkout, setup-python and
+  # upload-artifact all die with `GLIBC_2.27 not found` inside it. JS actions
+  # therefore run on the modern ubuntu host and only the build runs in the
+  # container, which chmods its output so the host can read the root-owned
+  # wheels.
+  # The image tag is pinned: `latest` DROPPED cp36/cp37/cp38. Do not bump it.
+  # ---------------------------------------------------------------------------
+  manylinux_x86_64:
+    name: manylinux2014 x86_64 wheel (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.6"
+            pytag: "cp36-cp36m"
+            setuptools: "setuptools==59.6.0"
+          - python: "3.7"
+            pytag: "cp37-cp37m"
+            setuptools: "setuptools==65.3.0"
+          - python: "3.8"
+            pytag: "cp38-cp38"
+            setuptools: "setuptools==65.3.0"
+          - python: "3.9"
+            pytag: "cp39-cp39"
+            setuptools: "setuptools==65.3.0"
+          - python: "3.10"
+            pytag: "cp310-cp310"
+            setuptools: "setuptools==65.3.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build wheel and run tests in manylinux2014 x86_64 container
+        env:
+          PYTAG: ${{ matrix.pytag }}
+          SETUPTOOLS_SPEC: ${{ matrix.setuptools }}
+        run: |
+          cat > seal_build_manylinux.sh <<'SEAL_EOF'
+          #!/bin/bash
+          set -ex
+          export PATH="/opt/python/${PYTAG}/bin:${PATH}"
+          python --version
+          python -m pip install "${SETUPTOOLS_SPEC}" "wheel==0.37.1"
+
+          # kokoro/release/python/linux/config.sh pre_build
+          cd /work
+          ./autogen.sh
+          CXXFLAGS="-fPIC -g -O2" ./configure
+          make -j$(nproc)
+
+          cd /work/python
+          python setup.py build_py
+          python setup.py bdist_wheel --cpp_implementation --compile_static_extension
+
+          # The reference x86_64 wheels DO contain protobuf.libs/, so multibuild's
+          # repair_wheelhouse (auditwheel) runs here.
+          mkdir -p /work/wheelhouse
+          auditwheel repair --plat manylinux2014_x86_64 -w /work/wheelhouse dist/*.whl
+          chmod -R a+rX /work/wheelhouse
+          ls -l /work/wheelhouse
+
+          # Full pure-python suite, exactly tox.ini's `python:` testenv.
+          export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+          python setup.py -q build_py
+          python setup.py -q build
+          python setup.py -q test -q
+          unset PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION
+
+          # config.sh run_tests: smoke the cpp extension of the INSTALLED
+          # distribution from an empty directory.
+          python -m pip install /work/wheelhouse/*.whl
+          mkdir -p /tmp/seal_smoke
+          cd /tmp/seal_smoke
+          python --version
+          python -c "from google.protobuf.pyext import _message;"
+          SEAL_EOF
+          docker run --rm \
+            -e PYTAG -e SETUPTOOLS_SPEC -e PIP_INDEX_URL \
+            -v "$PWD":/work -w /work \
+            quay.io/pypa/manylinux2014_x86_64:2022-09-12-1a61614 \
+            bash /work/seal_build_manylinux.sh
+
+      - name: Upload manylinux2014 x86_64 wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: manylinux2014-x86_64-py${{ matrix.python }}
+          path: wheelhouse/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # manylinux2014 aarch64 (cp37-cp310, no cp36 upstream).
+  # Cross-compiled on x86_64 with the same dockcross image Kokoro pinned -- no
+  # arm64 runner. protoc is built for aarch64, so build_py runs it through the
+  # qemu-aarch64 emulator that ships in the dockcross image via the
+  # protoc_qemu_wrapper.sh that config.sh creates.
+  # `auditwheel repair` is SKIPPED: config.sh overrides repair_wheelhouse for
+  # aarch64 (auditwheel needs the build arch to match the wheel arch) and the
+  # reference aarch64 wheels contain no protobuf.libs/.
+  # The generator pin here is wheel==0.36.2, NOT 0.37.1 -- dockcross shipped the
+  # older wheel and the four reference aarch64 wheels record it.
+  # ---------------------------------------------------------------------------
+  manylinux_aarch64:
+    name: manylinux2014 aarch64 wheel (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.7"
+            pytag: "cp37-cp37m"
+            setuptools: "setuptools==59.8.0"
+          - python: "3.8"
+            pytag: "cp38-cp38"
+            setuptools: "setuptools==59.8.0"
+          - python: "3.9"
+            pytag: "cp39-cp39"
+            setuptools: "setuptools==59.8.0"
+          - python: "3.10"
+            pytag: "cp310-cp310"
+            setuptools: "setuptools==59.8.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cross-compile wheel in dockcross manylinux2014-aarch64 container
+        env:
+          PYTAG: ${{ matrix.pytag }}
+          SETUPTOOLS_SPEC: ${{ matrix.setuptools }}
+        run: |
+          cat > seal_build_aarch64.sh <<'SEAL_EOF'
+          #!/bin/bash
+          set -ex
+          export PATH="/opt/python/${PYTAG}/bin:${PATH}"
+          python --version
+          python -m pip install "${SETUPTOOLS_SPEC}" "wheel==0.36.2"
+
+          cd /work
+          ./autogen.sh
+          CXXFLAGS="-fPIC -g -O2" ./configure --host=aarch64
+          make -j$(nproc)
+
+          # config.sh: run the crosscompiled protoc under qemu so build_py can
+          # still generate the _pb2.py files.
+          echo '#!/bin/bash' >protoc_qemu_wrapper.sh
+          echo 'exec qemu-aarch64 "../src/protoc" "$@"' >>protoc_qemu_wrapper.sh
+          chmod ugo+x protoc_qemu_wrapper.sh
+
+          cd /work/python
+          export PROTOC=../protoc_qemu_wrapper.sh
+          python setup.py build_py
+
+          # Rename the extension suffix to the target arch, and set --plat-name
+          # explicitly (dockcross provides the manylinux2014_aarch64 value in
+          # AUDITWHEEL_PLAT) so the wheel filename is well-formed.
+          export PROTOCOL_BUFFERS_OVERRIDE_EXT_SUFFIX="$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX").replace("-x86_64-linux-gnu.so", "-aarch64-linux-gnu.so"))')"
+          python setup.py bdist_wheel --cpp_implementation --compile_static_extension --plat-name=$AUDITWHEEL_PLAT
+
+          mkdir -p /work/wheelhouse
+          cp dist/*.whl /work/wheelhouse/
+          chmod -R a+rX /work/wheelhouse
+          ls -l /work/wheelhouse
+          SEAL_EOF
+          docker run --rm \
+            -e PYTAG -e SETUPTOOLS_SPEC -e PIP_INDEX_URL \
+            -v "$PWD":/work -w /work \
+            dockcross/manylinux2014-aarch64:20210706-65bf2dd \
+            bash /work/seal_build_aarch64.sh
+
+      - name: Upload manylinux2014 aarch64 wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: manylinux2014-aarch64-py${{ matrix.python }}
+          path: wheelhouse/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # macOS x86_64 (cp36-cp39, no cp310 upstream).
+  # Two things make this leg work:
+  #  * runs-on: macos-15-intel -- GitHub's supported NATIVE x86_64 runner. The
+  #    published tags are macosx_10_9_x86_64, so arm64 is the wrong target, and
+  #    CPython 3.6/3.7 predate arm64 macOS and cannot be built for it at all.
+  #    No Rosetta, no universal2, no arch -x86_64, no ARCHFLAGS.
+  #  * the official python.org `macosx10.9` pkg, which is exactly what
+  #    multibuild installed. Its interpreters are configured with a 10.9
+  #    deployment target, so the extension inherits LC_VERSION_MIN_MACOSX 10.9
+  #    like the reference .so files. Interpreters from actions/setup-python
+  #    carry the deployment target of the image that built them (10.14 / 13.7),
+  #    and MACOSX_DEPLOYMENT_TARGET cannot lower it -- distutils raises
+  #    "$MACOSX_DEPLOYMENT_TARGET mismatch" -- so it is not used here.
+  # ---------------------------------------------------------------------------
+  macos_x86_64:
+    name: macosx_10_9_x86_64 wheel (py${{ matrix.python }})
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    env:
+      _PYTHON_HOST_PLATFORM: macosx-10.9-x86_64
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.6"
+            pkg_version: "3.6.8"
+            setuptools: "setuptools==56.2.0"
+          - python: "3.7"
+            pkg_version: "3.7.9"
+            setuptools: "setuptools==65.3.0"
+          - python: "3.8"
+            pkg_version: "3.8.10"
+            setuptools: "setuptools==65.3.0"
+          - python: "3.9"
+            pkg_version: "3.9.13"
+            setuptools: "setuptools==65.3.0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install the python.org macosx10.9 framework build
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/python.pkg" \
+            "https://www.python.org/ftp/python/${{ matrix.pkg_version }}/python-${{ matrix.pkg_version }}-macosx10.9.pkg"
+          sudo installer -pkg "$RUNNER_TEMP/python.pkg" -target /
+          # The framework ships python3 / python3.X only; setup.py and the
+          # Kokoro scripts invoke `python`.
+          sudo ln -sf "/Library/Frameworks/Python.framework/Versions/${{ matrix.python }}/bin/python${{ matrix.python }}" /usr/local/bin/python
+          python --version
+          python -c "import sysconfig; print(sysconfig.get_config_var('MACOSX_DEPLOYMENT_TARGET'))"
+          python -m ensurepip --upgrade
+          python -m pip --version
+
+      - name: Install autotools
+        run: brew install autoconf automake libtool
+
+      - name: Pin build generators
+        run: python -m pip install "${{ matrix.setuptools }}" "wheel==0.37.1"
+
+      - name: Build protoc and libprotobuf
+        run: |
+          ./autogen.sh
+          CXXFLAGS="-std=c++14 -fPIC -g -O2" ./configure
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Build macosx_10_9_x86_64 wheel
+        working-directory: python
+        run: |
+          python setup.py build_py
+          python setup.py bdist_wheel --cpp_implementation --compile_static_extension --plat-name=macosx_10_9_x86_64
+          ls -l dist
+
+      - name: "Run the full pure-python test suite (tox.ini python: env)"
+        working-directory: python
+        env:
+          PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+        run: |
+          python setup.py -q build_py
+          python setup.py -q build
+          python setup.py -q test -q
+
+      - name: Smoke the cpp extension of the installed wheel (config.sh run_tests)
+        run: |
+          python -m pip install python/dist/*.whl
+          mkdir -p "$RUNNER_TEMP/seal_smoke"
+          cd "$RUNNER_TEMP/seal_smoke"
+          python --version
+          python -c "from google.protobuf.pyext import _message;"
+
+      - name: Upload macosx_10_9_x86_64 wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: macosx-10_9-x86_64-py${{ matrix.python }}
+          path: python/dist/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows win32 + win_amd64 (cp36-cp310) -- 10 wheels.
+  # Translated from kokoro/release/python/windows/build_single_artifact.bat onto
+  # the current windows runner image (windows-2025-vs2026, Visual Studio 18):
+  #  * -DCMAKE_POLICY_VERSION_MINIMUM=3.5, because cmake/CMakeLists.txt declares
+  #    cmake_minimum_required(VERSION 3.1.3) and CMake 4.x removed
+  #    compatibility with < 3.5. This is the escape hatch CMake itself names.
+  #  * NO -G generator. "Visual Studio 14"/"17 2022" both fail with "could not
+  #    find any instance of Visual Studio" on this image, and naming any
+  #    specific successor breaks at the next image bump. Only -A Win32|x64 is
+  #    passed and cmake picks the installed VS default.
+  #  * `cmake --build . --config Release` instead of `msbuild protobuf.sln`:
+  #    the VS 2026 generator emits no protobuf.sln, so msbuild fails MSB1009.
+  #  * the .lib and protoc.exe locations are DISCOVERED with Get-ChildItem
+  #    -Recurse rather than hardcoded to vcprojects\Release\, because the
+  #    output layout is generator-dependent.
+  #  * --warnings_as_errors is omitted (MSVC emits hundreds of C4244).
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Windows ${{ matrix.arch }} wheel (py${{ matrix.python }})
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.6"
+            arch: "x86"
+            cmake_arch: "Win32"
+            setuptools: "setuptools==59.6.0"
+            wheel: "0.37.1"
+          - python: "3.6"
+            arch: "x64"
+            cmake_arch: "x64"
+            setuptools: "setuptools==59.6.0"
+            wheel: "0.30.0"
+          - python: "3.7"
+            arch: "x86"
+            cmake_arch: "Win32"
+            setuptools: "setuptools==59.8.0"
+            wheel: "0.31.1"
+          - python: "3.7"
+            arch: "x64"
+            cmake_arch: "x64"
+            setuptools: "setuptools==59.8.0"
+            wheel: "0.31.1"
+          - python: "3.8"
+            arch: "x86"
+            cmake_arch: "Win32"
+            setuptools: "setuptools==59.8.0"
+            wheel: "0.37.1"
+          - python: "3.8"
+            arch: "x64"
+            cmake_arch: "x64"
+            setuptools: "setuptools==59.8.0"
+            wheel: "0.37.1"
+          - python: "3.9"
+            arch: "x86"
+            cmake_arch: "Win32"
+            setuptools: "setuptools==56.2.0"
+            wheel: "0.37.1"
+          - python: "3.9"
+            arch: "x64"
+            cmake_arch: "x64"
+            setuptools: "setuptools==56.2.0"
+            wheel: "0.37.1"
+          - python: "3.10"
+            arch: "x86"
+            cmake_arch: "Win32"
+            setuptools: "setuptools==59.8.0"
+            wheel: "0.37.1"
+          - python: "3.10"
+            arch: "x64"
+            cmake_arch: "x64"
+            setuptools: "setuptools==59.8.0"
+            wheel: "0.37.1"
+    steps:
+      # The Windows runner's default autocrlf=true is deliberately LEFT ON: the
+      # released Windows wheels ship their .py files with CRLF, so disabling it
+      # makes ~30 files per wheel diverge from the reference. The golden
+      # testdata that test_util.GoldenFile opens as 'rb' is protected instead by
+      # the `-text` rule in .gitattributes, so the four text_format tests that
+      # read it still pass.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch }}
+
+      - name: Pin build generators
+        run: |
+          python --version
+          python -c "import struct; print(struct.calcsize('P') * 8)"
+          python -m pip install "${{ matrix.setuptools }}" "wheel==${{ matrix.wheel }}"
+
+      - name: Build libprotobuf and protoc with cmake
+        run: |
+          New-Item -ItemType Directory -Force -Path src\.libs | Out-Null
+          New-Item -ItemType Directory -Force -Path vcprojects | Out-Null
+          Set-Location vcprojects
+          # Every -D argument is quoted: pwsh's argument-mode parser splits an
+          # unquoted `...=3.5` into `...=3` plus a stray `.5`, which cmake reports
+          # as `Invalid CMAKE_POLICY_VERSION_MINIMUM value "3"`.
+          # protobuf_MSVC_STATIC_RUNTIME works by regex-replacing /MD with /MT in
+          # CMAKE_CXX_FLAGS. Under CMP0091 the runtime library is no longer a
+          # CMAKE_CXX_FLAGS entry, so that replace is a silent no-op and
+          # libprotobuf.lib comes out /MD: its objects then carry
+          # /DEFAULTLIB:ucrt, which drags the dynamic UCRT (api-ms-win-crt-*.dll)
+          # into the linked extension even though the extension itself compiled
+          # /MT. Selecting the runtime explicitly through CMP0091 is what actually
+          # makes the static CRT stick, matching the reference .pyd, which imports
+          # no api-ms-win-crt-*.dll on either arch.
+          cmake -A "${{ matrix.cmake_arch }}" `
+            "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" `
+            "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW" `
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" `
+            "-Dprotobuf_MSVC_STATIC_RUNTIME=ON" `
+            "-Dprotobuf_BUILD_SHARED_LIBS=OFF" `
+            "-Dprotobuf_UNICODE=ON" `
+            "-Dprotobuf_BUILD_TESTS=OFF" `
+            ..\cmake
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build . --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Stage libprotobuf and protoc where setup.py expects them
+        run: |
+          Get-ChildItem -Path vcprojects -Recurse -Include libprotobuf.lib,libprotobuf-lite.lib,protoc.exe |
+            ForEach-Object { Write-Host "found $($_.FullName)" }
+          $lib = Get-ChildItem -Path vcprojects -Recurse -Filter libprotobuf.lib | Select-Object -First 1
+          $lite = Get-ChildItem -Path vcprojects -Recurse -Filter libprotobuf-lite.lib | Select-Object -First 1
+          $protoc = Get-ChildItem -Path vcprojects -Recurse -Filter protoc.exe | Select-Object -First 1
+          if (-not $lib) { throw "libprotobuf.lib was not produced" }
+          if (-not $lite) { throw "libprotobuf-lite.lib was not produced" }
+          if (-not $protoc) { throw "protoc.exe was not produced" }
+          # --compile_static_extension links these two as extra_objects...
+          Copy-Item $lib.FullName src\.libs\libprotobuf.a
+          Copy-Item $lite.FullName src\.libs\libprotobuf-lite.a
+          # ...and setup.py's non-static code path still links -lprotobuf, which
+          # is LNK1181 without this third copy.
+          Copy-Item $lib.FullName src\.libs\protobuf.lib
+          Add-Content -Path $env:GITHUB_PATH -Value $protoc.Directory.FullName
+
+      # win32 only. setup.py appends /MT to extra_compile_args, but distutils
+      # emits its own /MD afterwards and the last flag on the command line wins,
+      # so the extension ends up importing the dynamic UCRT
+      # (api-ms-win-crt-*.dll), which the reference win32 .pyd does not.
+      # cl.exe applies the _CL_ environment variable AFTER every command-line
+      # flag, so setting it there is what actually makes /MT stick.
+      # (The libprotobuf side is handled by the explicit CMP0091 runtime
+      # selection on the cmake step above; protobuf_MSVC_STATIC_RUNTIME alone is
+      # not enough under CMake 4.)
+      - name: Build win32 wheel (static CRT via _CL_)
+        if: matrix.arch == 'x86'
+        working-directory: python
+        env:
+          _CL_: /MT
+          # cl.exe honours _CL_, link.exe honours _LINK_, and both append AFTER
+          # every command-line flag. distutils' _msvccompiler hands link.exe
+          # `/nodefaultlib:libucrt.lib ucrt.lib`, which selects the DYNAMIC UCRT
+          # and defeats the /MT compile: the .pyd then imports six
+          # api-ms-win-crt-*.dll that the reference imports none of. Re-excluding
+          # ucrt.lib and naming libucrt.lib here reverses that pair, so the static
+          # UCRT wins and the import table matches the reference.
+          _LINK_: /nodefaultlib:ucrt.lib libucrt.lib
+        run: |
+          python setup.py build_py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python setup.py bdist_wheel --cpp_implementation --compile_static_extension
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+
+      # setup.py appends /MT to extra_compile_args on win32 only, so win_amd64
+      # needs _CL_ as well: the reference win_amd64 .pyd is statically linked too.
+      - name: Build win_amd64 wheel (static CRT via _CL_)
+        if: matrix.arch == 'x64'
+        working-directory: python
+        env:
+          _CL_: /MT
+          # cl.exe honours _CL_, link.exe honours _LINK_, and both append AFTER
+          # every command-line flag. distutils' _msvccompiler hands link.exe
+          # `/nodefaultlib:libucrt.lib ucrt.lib`, which selects the DYNAMIC UCRT
+          # and defeats the /MT compile: the .pyd then imports six
+          # api-ms-win-crt-*.dll that the reference imports none of. Re-excluding
+          # ucrt.lib and naming libucrt.lib here reverses that pair, so the static
+          # UCRT wins and the import table matches the reference.
+          _LINK_: /nodefaultlib:ucrt.lib libucrt.lib
+        run: |
+          python setup.py build_py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python setup.py bdist_wheel --cpp_implementation --compile_static_extension
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+
+      # The reference .pyd imports no api-ms-win-crt-*.dll. Report what ours
+      # imports so a CRT regression is visible in the log next to the build.
+      - name: Report the extension's CRT linkage
+        working-directory: python
+        run: |
+          $pyd = Get-ChildItem -Path build -Recurse -Filter "_message*.pyd" |
+            Select-Object -First 1
+          Write-Host "extension: $($pyd.FullName)"
+          $bytes = [System.IO.File]::ReadAllBytes($pyd.FullName)
+          $text = [System.Text.Encoding]::Latin1.GetString($bytes)
+          $hits = [regex]::Matches($text, "api-ms-win-crt-[a-z0-9-]+\.dll") |
+            ForEach-Object { $_.Value } | Sort-Object -Unique
+          if ($hits) {
+            Write-Host "dynamic UCRT imports present: $($hits -join ', ')"
+          } else {
+            Write-Host "static CRT: no api-ms-win-crt imports"
+          }
+
+      - name: "Run the full pure-python test suite (tox.ini python: env)"
+        working-directory: python
+        env:
+          PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+        run: |
+          python setup.py -q build_py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python setup.py -q build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python setup.py -q test -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke the cpp extension of the installed wheel (config.sh run_tests)
+        run: |
+          $whl = Get-ChildItem python\dist\*.whl | Select-Object -First 1
+          python -m pip install $whl.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\seal_smoke" | Out-Null
+          Set-Location "$env:RUNNER_TEMP\seal_smoke"
+          python --version
+          python -c "from google.protobuf.pyext import _message;"
+
+      - name: Upload Windows wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}-py${{ matrix.python }}
+          path: python/dist/
+          if-no-files-found: error

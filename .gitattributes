@@ -1,0 +1,6 @@
+# test_util.GoldenFile opens everything under this directory with mode 'rb',
+# so the Windows default autocrlf=true would mangle it and fail four
+# text_format tests. The .py sources must still check out CRLF on Windows:
+# the released Windows wheels ship CRLF, so autocrlf stays on globally and
+# only this testdata is protected.
+src/google/protobuf/testdata/** -text
